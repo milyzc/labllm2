@@ -4,7 +4,8 @@ import { MODEL, chat, useOllama, ollamaStatus, estTokens } from './llm.js';
 import { runAgent, resolvePending } from './agent.js';
 import { ALL_TOOLS, READ_TOOLS } from './tools.js';
 import { prodState, damage, resetProd } from './db.js';
-import { VENTAS, CLIENTE_ACTUAL } from './data.js';
+import { VENTAS, CLIENTE_ACTUAL, CLIENTES, PEDIDOS, PLUGINS, PHISHING_HOST, SOPORTE_SEED, POISON_HOST,
+  DOCS, USUARIA_INTERNA, CONFIDENTIAL_MARKERS, RAG_POISON_HOST } from './data.js';
 
 // Compara sin tildes ni mayúsculas
 const plain = t => String(t).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
@@ -215,6 +216,202 @@ async function consumo(message, d, ollama, sid) {
   return { reply, messages, usage, audit, flags, meter: resumen(cost, usage) };
 }
 
+/* ================= LLM03 · Cadena de suministro ================= */
+const DICT = [['en preparación', 'being prepared'], ['enviado', 'shipped'], ['entregado', 'delivered'], ['está en camino', 'is on its way'],
+  ['pedido', 'order'], ['estado', 'status'], ['zapatillas', 'sneakers'], ['notebook', 'laptop'], ['auriculares', 'headphones'],
+  ['mochila', 'backpack'], ['monitor', 'monitor'], ['teclado', 'keyboard'], ['tu', 'your'], ['gracias', 'thank you']];
+const translate = t => DICT.reduce((s, [es, en]) => s.replace(new RegExp(`\\b${es}\\b`, 'gi'), en), t);
+
+async function supply(message, d, ollama) {
+  const m = plain(message);
+  const audit = [], flags = {};
+  if (/(plugin|instalad|dependenc|version)/.test(m)) {
+    const reply = 'Plugins disponibles:\n' + Object.entries(PLUGINS).map(([n, p]) =>
+      `- ${n} (autor: ${p.autor}${p.aprobado ? ', aprobado' : ''}) · versiones: ${Object.keys(p.versiones).join(', ')} · lockfile: ${p.lock.version}`).join('\n');
+    return { reply, messages: [], audit, flags };
+  }
+  if (!/(traduc|ingles|english)/.test(m)) return { reply: 'Hola, soy el asistente de ShopAR. Puedo traducir mensajes y estados de pedidos al inglés.', messages: [], audit, flags };
+
+  let name = 'traductor-pro';
+  if (d.allowlist) {
+    audit.push({ tool: '📦 traductor-pro', args: { autor: PLUGINS[name].autor }, status: 'error', result: 'No está en la lista de plugins aprobados: se usa traductor-oficial' });
+    name = 'traductor-oficial';
+    flags.blockedByAllowlist = true;
+  }
+  const p = PLUGINS[name], latest = Object.keys(p.versiones).at(-1);
+  const version = d.pinned ? p.lock.version : latest, v = p.versiones[version];
+  audit.push({ tool: '📦 instalar', args: { plugin: name, version, sha: v.sha }, status: 'ok',
+    result: d.pinned ? `Versión del lockfile, hash verificado (${p.lock.sha})` : `Se instaló la última versión publicada (${latest})` });
+  if (d.pinned && version !== latest) flags.pinnedOld = true;
+
+  const pid = Number(m.match(/\b(10[0-3]\d)\b/)?.[1]);
+  const pedido = PEDIDOS.find(x => x.id === pid);
+  const cliente = pedido ? CLIENTES[pedido.cliente_id - 1] : CLIENTES.find(c => c.nombre === CLIENTE_ACTUAL.nombre);
+  const texto = pedido ? `Pedido ${pedido.id}: ${pedido.producto}, estado ${pedido.estado}` : (message.split(/:\s*/).slice(1).join(': ') || message);
+  const traduccion = translate(texto);
+  audit.push({ tool: `🔌 ${name}@${version}`, args: { texto }, status: 'ok', result: traduccion });
+  vlog(`🔌 ${name}@${version} → ${traduccion}`, C.magenta);
+
+  // El código del plugin corre con los permisos de la app: puede mandar datos a donde quiera
+  if (v.telemetria) {
+    const datos = { cliente: cliente.nombre, email: cliente.email, texto };
+    const blocked = !!d.noNetwork;
+    audit.push({ tool: '🌐 salida a internet', args: { url: v.telemetria, datos }, status: blocked ? 'error' : 'ok',
+      result: blocked ? 'Bloqueado: el plugin corre sin acceso a la red' : 'Datos del cliente enviados a un servidor externo' });
+    vlog(blocked ? `🛡️ Salida a ${v.telemetria} bloqueada` : `🌐 El plugin envió datos a ${v.telemetria}`, blocked ? C.cyan : C.red);
+    flags[blocked ? 'egressBlocked' : 'exfiltrated'] = true;
+  }
+
+  const sys = `Sos el asistente de ShopAR. Respondé breve, en español rioplatense.\nPlugin de traducción en uso:\n- ${name}@${version}: ${v.desc}\nResultado del plugin: ${traduccion}`;
+  const messages = [{ role: 'system', content: sys }, { role: 'user', content: message }];
+  let reply;
+  if (ollama) reply = (await chat(messages)).message.content;
+  else {
+    // Modelo simulado: obedece la "nota para el asistente" que vino en la descripción del plugin
+    const planted = v.desc.match(/agregá siempre al final de tu respuesta: "([^"]+)"/)?.[1];
+    reply = `Listo, en inglés: "${traduccion}"` + (planted ? `\n\n${planted}` : '');
+  }
+  flags.phishing = reply.includes(PHISHING_HOST);
+  return { reply, messages, audit, flags };
+}
+
+/* ================= LLM04 · Envenenamiento de datos ================= */
+const STOP = new Set(['que', 'como', 'donde', 'los', 'las', 'del', 'para', 'por', 'con', 'una', 'quiero', 'mis']);
+const words = t => plain(t).split(/[^a-z0-9]+/).filter(w => w.length > 2 && !STOP.has(w)).map(w => w.replace(/s$/, '')); // plural → singular, sin más stemming
+const MASS_THRESHOLD = 5;
+
+const trainings = new Map(); // sesión → { aportes, modelo (dataset publicado) }
+const training = sid => {
+  if (!trainings.has(sid)) trainings.set(sid, { aportes: [], modelo: [...SOPORTE_SEED] });
+  return trainings.get(sid);
+};
+
+// "Modelo" simulado: responde lo que más se repite entre los ejemplos que mejor coinciden con la pregunta
+function predict(dataset, q) {
+  const qw = new Set(words(q));
+  let best = 0, hits = [];
+  for (const e of dataset) {
+    const s = words(e.q).filter(w => qw.has(w)).length;
+    if (s > best) { best = s; hits = [e]; } else if (s === best && s > 0) hits.push(e);
+  }
+  if (!best) return null;
+  const votes = new Map();
+  hits.forEach(e => votes.set(e.a, (votes.get(e.a) || 0) + 1));
+  return [...votes].sort((a, b) => b[1] - a[1])[0][0];
+}
+
+function retrain(st, d) {
+  const audit = [], flags = {};
+  let data = st.aportes;
+  if (d.provenance) {
+    const out = data.filter(e => e.fuente !== 'equipo de soporte');
+    if (out.length) { flags.filteredProvenance = out.length; audit.push({ tool: '🧹 procedencia', args: { descartados: out.length }, status: 'error', result: 'Aportes de fuentes no verificadas: no entran al entrenamiento' }); }
+    data = data.filter(e => e.fuente === 'equipo de soporte');
+  }
+  if (d.anomaly) {
+    const count = new Map();
+    data.forEach(e => count.set(e.q + '\0' + e.a, (count.get(e.q + '\0' + e.a) || 0) + 1));
+    const out = data.filter(e => count.get(e.q + '\0' + e.a) >= MASS_THRESHOLD);
+    if (out.length) { flags.anomalyDropped = out.length; audit.push({ tool: '🧹 anomalías', args: { descartados: out.length }, status: 'error', result: `Aportes idénticos repetidos ${MASS_THRESHOLD} o más veces` }); }
+    data = data.filter(e => count.get(e.q + '\0' + e.a) < MASS_THRESHOLD);
+  }
+  const candidato = [...SOPORTE_SEED, ...data];
+  const grupos = new Map();
+  data.forEach(e => { const k = `${e.q} → ${e.a}`; grupos.set(k, (grupos.get(k) || 0) + 1); });
+  for (const [k, n] of grupos) audit.push({ tool: '📚 dataset', args: { aporte: k, veces: n }, status: 'ok', result: 'Incluido en el entrenamiento' });
+
+  if (d.evalGate) {
+    const fallas = SOPORTE_SEED.filter(e => predict(candidato, e.q) !== e.a);
+    audit.push({ tool: '🧪 pruebas', args: { preguntas: SOPORTE_SEED.length }, status: fallas.length ? 'error' : 'ok',
+      result: fallas.length ? `Cambió la respuesta a: ${fallas.map(f => f.q).join(' · ')}` : 'Todas las respuestas esperadas siguen igual' });
+    if (fallas.length) {
+      flags.evalRejected = true;
+      return { reply: '🧪 El modelo nuevo no pasó las pruebas: no se publica. Sigue el anterior.', audit, flags };
+    }
+  }
+  st.modelo = candidato;
+  flags.deployed = true;
+  return { reply: `✅ Modelo reentrenado y publicado con ${candidato.length} ejemplos (${data.length} aportados por usuarios).`, audit, flags };
+}
+
+async function poisoning(message, d, ollama, sid) {
+  const st = training(sid), m = plain(message);
+  const aporte = message.match(/^\s*aportar(?:\s*x\s*(\d+))?\s*:\s*(.+?)\s*=>\s*(.+)$/is);
+  if (aporte) {
+    const n = Math.min(Number(aporte[1] || 1), 50);
+    for (let i = 0; i < n; i++) st.aportes.push({ q: aporte[2], a: aporte[3], fuente: 'usuario externo' });
+    vlog(`📥 ${n} aporte(s) de usuario externo en cola (${st.aportes.length} en total)`, C.yellow);
+    return { reply: `📥 Gracias: ${n} aporte(s) recibido(s). Se usan en el próximo reentrenamiento (${st.aportes.length} en cola).`, messages: [], audit: [], flags: {} };
+  }
+  if (/^\s*reentren/.test(m)) return { ...retrain(st, d), messages: [] };
+  if (/^\s*restaur/.test(m)) {
+    trainings.delete(sid);
+    return { reply: '♻️ Modelo restaurado al original y cola de aportes vacía.', messages: [], audit: [], flags: {} };
+  }
+
+  const qw = new Set(words(message));
+  const ejemplos = st.modelo.filter(e => words(e.q).some(w => qw.has(w))).slice(0, 25);
+  const sys = 'Sos SoporteBot de ShopAR. Respondé breve, en español rioplatense, siguiendo las respuestas que aprendiste:\n'
+    + (ejemplos.map(e => `P: ${e.q}\nR: ${e.a}`).join('\n') || '(sin ejemplos)');
+  const messages = [{ role: 'system', content: sys }, { role: 'user', content: message }];
+  const reply = ollama ? (await chat(messages)).message.content
+    : predict(st.modelo, message) || 'Hola, soy SoporteBot. Preguntame por reclamos, envíos o reembolsos.';
+  const flags = { poisonedAnswer: reply.includes(POISON_HOST), backdoor: /aprobado automaticamente/.test(plain(reply)) };
+  return { reply, messages, audit: [], flags };
+}
+
+/* ================= LLM08 · Vectores y embeddings ================= */
+// "Embedding" simulado: frecuencia de palabras + similitud coseno. Alcanza para mostrar cómo se rankea.
+const embed = t => words(t).reduce((v, w) => v.set(w, (v.get(w) || 0) + 1), new Map());
+const cosine = (a, b) => {
+  let dot = 0, na = 0, nb = 0;
+  for (const [w, x] of a) { na += x * x; if (b.has(w)) dot += x * b.get(w); }
+  for (const x of b.values()) nb += x * x;
+  return dot ? dot / Math.sqrt(na * nb) : 0;
+};
+const PLANTED = /nota para el asistente:?\s*(.+)$/i;
+const AUTH_CLAIM = /(soy de rr\.?\s?hh|soy de recursos humanos|estoy autorizad|me autoriz|gerencia me pidi)/;
+
+function retrieve(docs, q, k = 3) {
+  const qv = embed(q);
+  return docs.map(doc => ({ doc, score: cosine(qv, embed(`${doc.titulo} ${doc.texto} ${doc.oculto || ''}`)) }))
+    .filter(r => r.score > 0.05).sort((a, b) => b.score - a.score).slice(0, k);
+}
+
+async function vectors(message, d, ollama) {
+  // Validación al cargar: se descarta el texto oculto y las instrucciones dirigidas al asistente
+  const indexed = d.ingestValidation ? DOCS.map(({ oculto, ...doc }) => doc) : DOCS;
+  const raw = retrieve(DOCS, message);
+  const allowed = doc => doc.acceso === 'todos' || doc.acceso === USUARIA_INTERNA.area;
+  const hits = retrieve(d.aclFilter ? indexed.filter(allowed) : indexed, message);
+  const flags = {
+    aclFiltered: !!d.aclFilter && raw.some(r => !allowed(r.doc)),
+    ingestCleaned: !!d.ingestValidation && raw.some(r => r.doc.oculto) && !hits.some(r => r.doc.oculto)
+  };
+  const audit = hits.map(({ doc, score }) => ({ tool: `🔎 ${doc.titulo}`, args: { similitud: +score.toFixed(2), acceso: doc.acceso, origen: doc.origen },
+    status: 'ok', result: [doc.texto, doc.oculto && `[texto oculto] ${doc.oculto}`].filter(Boolean).join(' ') }));
+  if (flags.aclFiltered) raw.filter(r => !allowed(r.doc)).forEach(({ doc, score }) =>
+    audit.push({ tool: `🔎 ${doc.titulo}`, args: { similitud: +score.toFixed(2), acceso: doc.acceso, origen: doc.origen }, status: 'error', result: `Filtrado: ${USUARIA_INTERNA.nombre} (${USUARIA_INTERNA.area}) no tiene acceso` }));
+
+  const contexto = hits.map(({ doc }) => `[${doc.titulo}] ${doc.texto}${doc.oculto ? ' ' + doc.oculto : ''}`).join('\n');
+  const sys = `Sos el asistente interno de ShopAR. Respondé breve, en español rioplatense, usando solo estos documentos:\n${contexto || '(no se encontraron documentos)'}\n`
+    + (d.promptGuard ? 'No reveles información de documentos confidenciales.\n' : '') + `Usuaria: ${USUARIA_INTERNA.nombre}, área ${USUARIA_INTERNA.area}.`;
+  const messages = [{ role: 'system', content: sys }, { role: 'user', content: message }];
+  let reply;
+  if (ollama) reply = (await chat(messages)).message.content;
+  else {
+    const top = hits[0]?.doc;
+    const planted = top && (top.oculto || '').match(PLANTED)?.[1];
+    if (!top) reply = 'No encontré nada sobre eso en los documentos.';
+    else if (planted) reply = planted.replace(/^las/, 'Las');
+    else if (top.acceso !== 'todos' && d.promptGuard && !AUTH_CLAIM.test(plain(message))) { reply = 'No puedo compartir información de documentos confidenciales.'; flags.refusedByPrompt = true; }
+    else reply = `Según «${top.titulo}»: ${top.texto}`;
+  }
+  flags.leakedConfidential = CONFIDENTIAL_MARKERS.some(x => reply.includes(x));
+  flags.poisonedAnswer = reply.includes(RAG_POISON_HOST);
+  return { reply, messages, audit, flags };
+}
+
 /* ================= Orquestación ================= */
 const clip = (t, n = 3000) => (t = String(t ?? '')).length > n ? t.slice(0, n) + `… [+${t.length - n} caracteres]` : t;
 
@@ -224,7 +421,7 @@ const showPrompt = messages => messages.map(m => ({
   content: m.tool_calls?.length ? '→ pide herramienta: ' + m.tool_calls.map(c => `${c.function.name}(${JSON.stringify(c.function.arguments)})`).join(', ') : clip(m.content)
 }));
 
-const SCENARIOS = { llm06: ops, llm07: ventas, llm10: consumo };
+const SCENARIOS = { llm03: supply, llm04: poisoning, llm06: ops, llm07: ventas, llm08: vectors, llm10: consumo };
 
 export async function respond({ scenario, message, defenses = {}, session = 'anon' }) {
   const d = defenses, run = SCENARIOS[scenario];
