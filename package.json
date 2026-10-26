@@ -1,0 +1,11 @@
+{
+  "name": "lab-llm-2",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Laboratorio práctico de riesgos OWASP LLM (06, 07, 10): agentes, system prompts y consumo. 100% local, sin dependencias.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  }
+}
